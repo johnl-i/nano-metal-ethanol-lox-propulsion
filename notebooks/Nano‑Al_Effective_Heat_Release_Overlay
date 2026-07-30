@@ -1,0 +1,179 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import math
+import os
+
+R_UNIV = 8.314462618  # J/(mol*K) 
+
+BASELINE_CSV = "ethanol_lox_baseline_MR_sweep.csv"  # change if your filename/path differs
+
+# Colab-only helper (safe to ignore if not in Colab)
+try:
+    from google.colab import files  # type: ignore
+    IN_COLAB = True
+except Exception:
+    IN_COLAB = False
+
+if not os.path.exists(BASELINE_CSV):
+    msg = (
+        f"Could not find '{BASELINE_CSV}' in the current working directory.\n\n"
+        "Fix options:\n"
+        "  (A) In Colab: left sidebar → Files → Upload → select the CSV\n"
+        "  (B) Or set BASELINE_CSV to the correct path (e.g., a Drive path)\n"
+        "  (C) Or run Notebook 1 in the same runtime to generate the CSV\n\n"
+        "If you are in Colab, you can also run: files.upload()"
+    )
+    print(msg)
+    if IN_COLAB:
+        print("Tip: Run `files.upload()` in a new cell to upload the CSV.")
+    raise FileNotFoundError(msg)
+
+df_base = pd.read_csv(BASELINE_CSV)
+
+print("Loaded baseline:", BASELINE_CSV)
+print("Columns:", list(df_base.columns))
+df_base.head() 
+
+
+rename_map = {
+    "isp_vac_s": "Isp_vac_s",
+    "Isp_vac": "Isp_vac_s",
+    "IspVac_s": "Isp_vac_s",
+    "MR": "MR_O_F",
+    "MR_O/F": "MR_O_F",
+    "Tcomb": "Tcomb_K",
+    "T_comb_K": "Tcomb_K",
+    "molwt": "MolWt",
+    "molWt": "MolWt",
+    "Gamma": "gamma",
+    "Gamma_chamber": "gamma",
+}
+
+df_base = df_base.rename(columns={c: rename_map.get(c, c) for c in df_base.columns})
+
+required = {"MR_O_F", "Tcomb_K", "Isp_vac_s", "MolWt", "gamma"}
+missing = required - set(df_base.columns)
+if missing:
+    raise ValueError(
+        f"Baseline CSV is missing required columns after rename: {missing}\n"
+        f"Columns seen: {list(df_base.columns)}"
+    )
+
+df_base.head()
+
+df_valid = df_base.dropna(subset=["Isp_vac_s"]).copy()
+if df_valid.empty:
+    raise ValueError("No valid baseline rows found (Isp_vac_s all NaN).")
+
+best_idx = df_valid["Isp_vac_s"].idxmax()
+best_row = df_valid.loc[best_idx]
+
+MR_best = float(best_row["MR_O_F"])
+MR_targets = [0.9 * MR_best, MR_best, 1.1 * MR_best]
+
+MR_best, MR_targets
+
+def nearest_baseline_row(df: pd.DataFrame, mr_target: float) -> pd.Series:
+    i = (df["MR_O_F"] - mr_target).abs().idxmin()
+    return df.loc[i]
+
+used = [nearest_baseline_row(df_valid, mr) for mr in MR_targets]
+[(float(r["MR_O_F"]), float(r["Isp_vac_s"]), float(r["Tcomb_K"])) for r in used]
+
+f_loadings = np.array([0.00, 0.01,0.02, 0.03, 0.04, 0.05])
+eta_band   = np.array([0.5, 0.8])
+
+Q_Al = 3.11e7  # J/kg (Al -> Al2O3 theoretical max; eta handles effective in-chamber release)
+
+f_loadings, eta_band, Q_Al
+
+def cp_eff_from_gamma_molwt(gamma: float, molwt_g_per_mol: float) -> float:
+    M = molwt_g_per_mol / 1000.0   # kg/mol
+    R_spec = R_UNIV / M            # J/(kg*K)
+    return gamma * R_spec / (gamma - 1.0)
+
+Cp_best = cp_eff_from_gamma_molwt(float(best_row["gamma"]), float(best_row["MolWt"]))
+Cp_best
+
+def isp_scaled_with_temperature(Isp0: float, T0: float, T_new: float) -> float:
+    return Isp0 * math.sqrt(T_new / T0)
+
+rows = []
+
+for mr_target in MR_targets:
+    base = nearest_baseline_row(df_valid, mr_target)
+
+    MR_used = float(base["MR_O_F"])
+    T0 = float(base["Tcomb_K"])
+    Isp0 = float(base["Isp_vac_s"])   # fixed column name
+    gamma = float(base["gamma"])
+    molwt = float(base["MolWt"])
+
+    Cp_eff = cp_eff_from_gamma_molwt(gamma, molwt)
+
+    for f in f_loadings:
+        for eta in eta_band:
+            dq = eta * f * Q_Al          # J/kg-propellant
+            dT = dq / Cp_eff             # K
+            T_new = T0 + dT
+            Isp_new = isp_scaled_with_temperature(Isp0, T0, T_new)
+
+            rows.append({
+                "MR_target": mr_target,
+                "MR_used": MR_used,
+                "f_loading": f,
+                "eta": eta,
+                "T0_K": T0,
+                "dT_K": dT,
+                "Tnew_K": T_new,
+                "Isp0_s": Isp0,
+                "Ispnew_s": Isp_new,
+                "dIsp_s": Isp_new - Isp0,
+                "dIsp_pct": 100.0 * (Isp_new - Isp0) / Isp0,
+                "Cp_eff_J_per_kgK": Cp_eff,
+            })
+
+df_res = pd.DataFrame(rows)
+df_res.head(12)
+
+df_res[df_res["f_loading"] == 0.0][["MR_used", "eta", "dT_K", "dIsp_s"]].head(10)
+
+def plot_metric_band(df_plot: pd.DataFrame, metric: str, ylabel: str):
+    for mr_target in MR_targets:
+        sub = df_plot[df_plot["MR_target"] == mr_target].copy().sort_values("f_loading")
+        x = sub["f_loading"].unique()
+
+        y_lo = sub[sub["eta"] == float(eta_band.min())][metric].values
+        y_hi = sub[sub["eta"] == float(eta_band.max())][metric].values
+
+        mr_used = float(nearest_baseline_row(df_valid, mr_target)["MR_O_F"])
+
+        plt.figure(figsize=(7,4))
+        plt.plot(x, y_lo, marker="o", linewidth=1, label=f"η = {eta_band.min():.1f}")
+        plt.plot(x, y_hi, marker="o", linewidth=1, label=f"η = {eta_band.max():.1f}")
+        plt.xlabel("Nano‑Al mass fraction f (of total propellant)")
+        plt.ylabel(ylabel)
+        plt.title(f"{ylabel} vs nano‑Al loading (MR used ≈ {mr_used:.3f})")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.show()
+
+plot_metric_band(df_res, "dIsp_s", "ΔIsp (s)")
+
+plot_metric_band(df_res, "dT_K", "ΔT (K)")
+
+OUT_CSV = "ethanol_lox_nanoAl_effective_heat_model.csv"
+df_res.to_csv(OUT_CSV, index=False)
+OUT_CSV
+
+best_used = float(nearest_baseline_row(df_valid, MR_best)["MR_O_F"])
+sub_best = df_res[df_res["MR_used"] == best_used].copy()
+
+summary = sub_best.pivot_table(
+    index="f_loading",
+    columns="eta",
+    values=["dIsp_s", "dT_K", "dIsp_pct"],
+).sort_index(axis=1, level=1)
+
+summary
